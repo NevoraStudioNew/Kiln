@@ -39,13 +39,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Menyiapkan Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Menyiapkan Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ""
 
       - name: Mendeteksi jenis proyek
         id: detect
