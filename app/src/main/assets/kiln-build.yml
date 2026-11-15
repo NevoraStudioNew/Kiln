@@ -1,0 +1,247 @@
+# Kiln — Bakar script jadi APK, langsung dari HP.
+# Open source di bawah Lisensi MIT.
+# Copyright (c) 2026 Nevora Studio
+# Saluran resmi: https://whatsapp.com/channel/0029VbDwlX6EawdkN0IZm713
+
+name: Kiln Build
+run-name: Kiln v${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versi rilis (diisi otomatis oleh Kiln)
+        required: true
+        default: "1.0.0"
+      version_code:
+        description: Version code (diisi otomatis oleh Kiln)
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kiln-build
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  VERSION_CODE: ${{ inputs.version_code }}
+  APP_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Mengambil kode
+        uses: actions/checkout@v4
+
+      - name: Menyiapkan Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Menyiapkan Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Mendeteksi jenis proyek
+        id: detect
+        run: |
+          if [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "type=gradle" >> "$GITHUB_OUTPUT"
+            if [ -f gradlew ]; then
+              echo "need_gradle=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "need_gradle=true" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ -f index.html ]; then
+            echo "type=web" >> "$GITHUB_OUTPUT"
+            echo "need_gradle=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Proyek tidak dikenali. Butuh settings.gradle(.kts) untuk proyek Android, atau index.html untuk proyek web."
+            exit 1
+          fi
+
+      - name: Menyiapkan Gradle
+        if: steps.detect.outputs.need_gradle == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Membangun APK (proyek Android)
+        if: steps.detect.outputs.type == 'gradle'
+        run: |
+          set -e
+          if [ -f gradlew ]; then chmod +x gradlew; GR=./gradlew; else GR=gradle; fi
+          cat > "$RUNNER_TEMP/kiln.init.gradle" <<'INIT'
+          allprojects {
+            afterEvaluate { p ->
+              def ext = p.extensions.findByName("android")
+              if (ext != null && p.plugins.hasPlugin("com.android.application")) {
+                ext.defaultConfig.versionName = System.getenv("VERSION")
+                ext.defaultConfig.versionCode = System.getenv("VERSION_CODE").toInteger()
+              }
+            }
+          }
+          INIT
+          $GR --init-script "$RUNNER_TEMP/kiln.init.gradle" assembleRelease --no-daemon --stacktrace
+          find . -path '*build/outputs/apk/release/*.apk' -not -name '*unaligned*' > "$RUNNER_TEMP/apks.txt"
+
+      - name: Membangun APK (proyek web)
+        if: steps.detect.outputs.type == 'web'
+        run: |
+          set -e
+          W="$RUNNER_TEMP/kilnweb"
+          mkdir -p "$W/app/src/main/assets" "$W/app/src/main/java/kiln/web"
+          rsync -a --exclude='.git' --exclude='.github' --exclude='.kiln' ./ "$W/app/src/main/assets/"
+          SAFE=$(echo "$APP_NAME" | tr -cd 'a-zA-Z0-9' | tr 'A-Z' 'a-z')
+          [ -z "$SAFE" ] && SAFE=app
+          PKG="kiln.web.p$SAFE"
+          LABEL=$(echo "$APP_NAME" | tr -cd 'a-zA-Z0-9 _-')
+          ICON=""
+          if [ -f icon.png ]; then
+            mkdir -p "$W/app/src/main/res/mipmap-xxxhdpi"
+            cp icon.png "$W/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+            ICON='android:icon="@mipmap/ic_launcher"'
+          fi
+          cat > "$W/settings.gradle" <<'EOF2'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "KilnWeb"
+          include ':app'
+          EOF2
+          cat > "$W/build.gradle" <<'EOF2'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF2
+          cat > "$W/app/build.gradle" <<EOF2
+          plugins { id 'com.android.application' }
+          android {
+            namespace '$PKG'
+            compileSdk 34
+            defaultConfig {
+              applicationId '$PKG'
+              minSdk 24
+              targetSdk 34
+              versionCode $VERSION_CODE
+              versionName '$VERSION'
+            }
+            buildTypes { release { minifyEnabled false } }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          EOF2
+          cat > "$W/app/src/main/AndroidManifest.xml" <<EOF2
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="$LABEL" $ICON android:usesCleartextTraffic="true"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <activity android:name="kiln.web.MainActivity" android:exported="true"
+                  android:configChanges="orientation|screenSize|keyboardHidden">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF2
+          cat > "$W/app/src/main/java/kiln/web/MainActivity.java" <<'EOF2'
+          package kiln.web;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          public class MainActivity extends Activity {
+            private WebView w;
+            @Override protected void onCreate(Bundle b) {
+              super.onCreate(b);
+              w = new WebView(this);
+              WebSettings s = w.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setAllowFileAccess(true);
+              s.setMediaPlaybackRequiresUserGesture(false);
+              w.setWebViewClient(new WebViewClient());
+              w.setWebChromeClient(new WebChromeClient());
+              setContentView(w);
+              w.loadUrl("file:///android_asset/index.html");
+            }
+            @Override public void onBackPressed() {
+              if (w.canGoBack()) w.goBack(); else super.onBackPressed();
+            }
+          }
+          EOF2
+          gradle -p "$W" assembleRelease --no-daemon --stacktrace
+          find "$W" -path '*outputs/apk/release/*.apk' -not -name '*unaligned*' > "$RUNNER_TEMP/apks.txt"
+
+      - name: Menandatangani APK
+        env:
+          KS_B64: ${{ secrets.KILN_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.KILN_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KILN_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KILN_KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$KS_B64" ]; then
+            echo "::error::Keystore belum ada di Secrets. Buka Kiln dan jalankan build dari aplikasi agar keystore dibuat otomatis."
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/apks.txt" ]; then
+            echo "::error::Tidak ada APK hasil build ditemukan."
+            exit 1
+          fi
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/kiln.p12"
+          BT_DIR="$ANDROID_HOME/build-tools"
+          BT=$(ls -1 "$BT_DIR" 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$BT" ]; then
+            sdkmanager "build-tools;34.0.0"
+            BT=34.0.0
+          fi
+          T="$BT_DIR/$BT"
+          COUNT=$(grep -c . "$RUNNER_TEMP/apks.txt")
+          mkdir -p out
+          while read -r apk; do
+            [ -z "$apk" ] && continue
+            if [ "$COUNT" -eq 1 ]; then
+              OUT="${APP_NAME}-${VERSION}.apk"
+            else
+              OUT="${APP_NAME}-${VERSION}-$(basename "$apk" .apk).apk"
+            fi
+            "$T/zipalign" -p -f 4 "$apk" "$RUNNER_TEMP/aligned.apk"
+            "$T/apksigner" sign --ks "$RUNNER_TEMP/kiln.p12" --ks-type pkcs12 \
+              --ks-pass env:KS_PASS --ks-key-alias "$KS_ALIAS" --key-pass env:KEY_PASS \
+              --out "out/$OUT" "$RUNNER_TEMP/aligned.apk"
+            "$T/apksigner" verify "out/$OUT"
+          done < "$RUNNER_TEMP/apks.txt"
+          rm -f "$RUNNER_TEMP/kiln.p12"
+
+      - name: Menerbitkan ke Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${VERSION}"
+          gh release delete "$TAG" --cleanup-tag --yes -R "$GITHUB_REPOSITORY" 2>/dev/null || true
+          SUMS=$(cd out && sha256sum *.apk)
+          {
+            echo "## ${APP_NAME} ${VERSION}"
+            echo
+            echo "Dibangun dengan **Kiln** oleh Nevora Studio."
+            echo
+            echo "- Build: #${GITHUB_RUN_NUMBER}"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo
+            echo "SHA-256:"
+            echo '```'
+            echo "$SUMS"
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" out/*.apk --title "${APP_NAME} ${VERSION}" \
+            --notes-file notes.md --target "$GITHUB_SHA" -R "$GITHUB_REPOSITORY"
